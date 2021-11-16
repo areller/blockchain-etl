@@ -16,6 +16,8 @@
 -export([to_actors/1, q_insert_transaction_actors/2]).
 
 -define(S_INSERT_ACTOR, "insert_actor").
+-define(S_INSERT_ACTOR_10, "insert_actor_10").
+-define(S_INSERT_ACTOR_100, "insert_actor_100").
 
 -record(state, {}).
 
@@ -24,20 +26,26 @@
 %%
 
 prepare_conn(Conn) ->
-    {ok, S1} =
+    MkQueryFun = fun(Rows) ->
         epgsql:parse(
             Conn,
             ?S_INSERT_ACTOR,
             [
                 "insert into transaction_actors (block, actor, actor_role, transaction_hash) ",
-                "values ($1, $2, $3, $4) ",
+                "values  ",
+                be_utils:make_values_list(4, Rows),
                 "on conflict do nothing"
             ],
             []
-        ),
-
+        )
+    end,
+    {ok, S1} = MkQueryFun(1),
+    {ok, S10} = MkQueryFun(10),
+    {ok, S100} = MkQueryFun(100),
     #{
-        ?S_INSERT_ACTOR => S1
+        ?S_INSERT_ACTOR => S1,
+        ?S_INSERT_ACTOR_10 => S10,
+        ?S_INSERT_ACTOR_100 => S100
     }.
 
 %%
@@ -49,14 +57,37 @@ init(_) ->
 
 load_block(Conn, _Hash, Block, _Sync, _Ledger, State = #state{}) ->
     Queries = q_insert_block_transaction_actors(Block),
-    ok = ?BATCH_QUERY(Conn, Queries),
+    execute_queries(Conn, Queries),
     {ok, State}.
+
+execute_queries(Conn, Queries) when length(Queries) > 100 ->
+    lists:foreach(
+        fun
+            (Q) when length(Q) == 100 ->
+                ok = ?PREPARED_QUERY(Conn, ?S_INSERT_ACTOR_100, lists:flatten(Q));
+            (Q) ->
+                execute_queries(Conn, Q)
+        end,
+        be_utils:split_list(Queries, 100)
+    );
+execute_queries(Conn, Queries) when length > 10 ->
+    lists:foreach(
+        fun
+            (Q) when length(Q) == 10 ->
+                ok = ?PREPARED_QUERY(Conn, ?S_INSERT_ACTOR_10, lists:flatten(Q));
+            (Q) ->
+                execute_queries(Conn, Q)
+        end,
+        be_utils:split_list(Queries, 10)
+    );
+execute_queries(Conn, Queries) ->
+    ok = ?BATCH_QUERY(Conn, [{?S_INSERT_ACTOR, I} || I <- Queries]).
 
 q_insert_transaction_actors(Height, Txn) ->
     TxnHash = ?BIN_TO_B64(blockchain_txn:hash(Txn)),
     lists:map(
         fun({Role, Key}) ->
-                       {?S_INSERT_ACTOR, [Height, ?BIN_TO_B58(Key), Role, TxnHash]}
+            [Height, ?BIN_TO_B58(Key), Role, TxnHash]
         end,
         to_actors(Txn)
     ).
@@ -64,7 +95,7 @@ q_insert_transaction_actors(Height, Txn) ->
 q_insert_block_transaction_actors(Block) ->
     Height = blockchain_block_v1:height(Block),
     Txns = blockchain_block_v1:transactions(Block),
-    be_utils:pmap(
+    lists:map(
         fun(Txn) ->
             q_insert_transaction_actors(Height, Txn)
         end,
